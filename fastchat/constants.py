@@ -8,12 +8,19 @@ import os
 REPO_PATH = os.path.dirname(os.path.dirname(__file__))
 
 # Survey Link URL (to be removed) #00729c
-SURVEY_LINK = """<div style='text-align: left; margin: 20px 0;'>
-    <div style='display: inline-block; border: 2px solid #00729c; padding: 20px; padding-bottom: 10px; padding-top: 10px; border-radius: 5px;'>
-        <span style='color: #00729c; font-weight: bold;'>New Launch! Copilot Arena: <a href='https://marketplace.visualstudio.com/items?itemName=copilot-arena.copilot-arena' style='color: #00729c; text-decoration: underline;'>VS Code Extension</a> to compare Top LLMs</span>
+# SURVEY_LINK = """<div style='text-align: left; margin: 20px 0;'>
+#     <div style='display: inline-block; border: 2px solid #00729c; padding: 20px; padding-bottom: 10px; padding-top: 10px; border-radius: 5px;'>
+#         <span style='color: #00729c; font-weight: bold;'>New Launch! Copilot Arena: <a href='https://marketplace.visualstudio.com/items?itemName=copilot-arena.copilot-arena' style='color: #00729c; text-decoration: underline;'>VS Code Extension</a> to compare Top LLMs</span>
+#     </div>
+# </div>"""
+# SURVEY_LINK = ""
+
+COLOR = "#008B8B"
+SURVEY_LINK = f"""<div style='text-align: left; margin: 20px 0;'>
+    <div style='display: inline-block; border: 2px solid {COLOR}; padding: 20px; padding-bottom: 10px; padding-top: 10px; border-radius: 5px; background-color: #ECFAE5'>
+        <span style='color: {COLOR}; font-weight: bold;'>New Arena UI at <a href='https://beta.lmarena.ai/'>BETA.lmarena.ai</a>! Check it out & give feedback!</a></span>
     </div>
 </div>"""
-# SURVEY_LINK = ""
 
 ##### For the gradio web server
 SERVER_ERROR_MSG = (
