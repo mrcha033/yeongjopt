@@ -29,47 +29,34 @@ from fastchat.utils import build_logger
 
 
 logger = build_logger("controller", "controller.log")
-
-
-class DispatchMethod(Enum):
-    LOTTERY = auto()
-    SHORTEST_QUEUE = auto()
-
-    @classmethod
-    def from_str(cls, name):
-        if name == "lottery":
-            return cls.LOTTERY
-        elif name == "shortest_queue":
-            return cls.SHORTEST_QUEUE
-        else:
-            raise ValueError(f"Invalid dispatch method")
+app = FastAPI() # Define the FastAPI app instance globally
+controller_instance: 'Controller' = None # Global controller instance
 
 
 @dataclasses.dataclass
 class WorkerInfo:
-    model_names: List[str]
+    model_names: List[str]  # Will be a list with one model name
     speed: int
     queue_length: int
     check_heart_beat: bool
     last_heart_beat: str
-    multimodal: bool
+    multimodal: bool # Keep for now, can be removed if vision is not planned for yeongjopt
 
 
-def heart_beat_controller(controller):
+def heart_beat_controller(controller_obj: 'Controller'): # Use a more descriptive name for 'controller' argument
     while True:
         time.sleep(CONTROLLER_HEART_BEAT_EXPIRATION)
-        controller.remove_stale_workers_by_expiration()
+        if controller_obj: # Ensure controller_instance is initialized
+            controller_obj.remove_stale_workers_by_expiration()
 
 
 class Controller:
-    def __init__(self, dispatch_method: str):
-        # Dict[str -> WorkerInfo]
-        self.worker_info = {}
-        self.dispatch_method = DispatchMethod.from_str(dispatch_method)
-
+    def __init__(self, dispatch_method: str = "shortest_queue"): # dispatch_method is vestigial
+        self.worker_info = {} # Stores info for the single worker
         self.heart_beat_thread = threading.Thread(
             target=heart_beat_controller, args=(self,)
         )
+        self.heart_beat_thread.daemon = True # Ensure thread exits when main program exits
         self.heart_beat_thread.start()
 
     def register_worker(
@@ -79,311 +66,240 @@ class Controller:
         worker_status: dict,
         multimodal: bool,
     ):
-        if worker_name not in self.worker_info:
-            logger.info(f"Register a new worker: {worker_name}")
+        if not self.worker_info: # Only allow one worker
+            logger.info(f"Registering worker: {worker_name}")
+            if not worker_status: # Attempt to get status if not provided
+                worker_status = self.get_worker_status_direct(worker_name) # Renamed to avoid conflict
+            if not worker_status:
+                logger.error(f"Failed to get status for worker {worker_name} during registration.")
+                return False
+
+            self.worker_info[worker_name] = WorkerInfo(
+                worker_status["model_names"],
+                worker_status["speed"],
+                worker_status["queue_length"],
+                check_heart_beat,
+                time.time(),
+                multimodal,
+            )
+            logger.info(f"Register done: {worker_name}, {worker_status}")
+            return True
         else:
-            logger.info(f"Register an existing worker: {worker_name}")
+            # Prevent re-registering if a worker already exists.
+            if worker_name not in self.worker_info:
+                 logger.warning(f"A worker is already registered. Ignoring new registration: {worker_name}")
+                 return False # Do not allow a new worker if one is already registered
+            else: # Allow re-registration of the same worker (e.g. on restart)
+                 logger.info(f"Re-registering existing worker: {worker_name}")
+                 # Update status
+                 if not worker_status:
+                    worker_status = self.get_worker_status_direct(worker_name)
+                 if not worker_status:
+                    logger.error(f"Failed to get status for worker {worker_name} during re-registration.")
+                    return False
+                 self.worker_info[worker_name] = WorkerInfo(
+                    worker_status["model_names"],
+                    worker_status["speed"],
+                    worker_status["queue_length"],
+                    check_heart_beat,
+                    time.time(),
+                    multimodal,
+                )
+                 logger.info(f"Re-register done: {worker_name}, {worker_status}")
+                 return True
 
-        if not worker_status:
-            worker_status = self.get_worker_status(worker_name)
-        if not worker_status:
-            return False
 
-        self.worker_info[worker_name] = WorkerInfo(
-            worker_status["model_names"],
-            worker_status["speed"],
-            worker_status["queue_length"],
-            check_heart_beat,
-            time.time(),
-            multimodal,
-        )
-
-        logger.info(f"Register done: {worker_name}, {worker_status}")
-        return True
-
-    def get_worker_status(self, worker_name: str):
+    def get_worker_status_direct(self, worker_name: str): # Renamed for clarity
+        # This method directly fetches status, used internally
         try:
-            r = requests.post(worker_name + "/worker_get_status", timeout=5)
+            r = requests.post(worker_name + "/worker_get_status", timeout=WORKER_API_TIMEOUT)
+            r.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            return r.json()
         except requests.exceptions.RequestException as e:
-            logger.error(f"Get status fails: {worker_name}, {e}")
+            logger.error(f"Get status direct fails for {worker_name}: {e}")
             return None
-
-        if r.status_code != 200:
-            logger.error(f"Get status fails: {worker_name}, {r}")
-            return None
-
-        return r.json()
 
     def remove_worker(self, worker_name: str):
-        del self.worker_info[worker_name]
+        if worker_name in self.worker_info:
+            del self.worker_info[worker_name]
+            logger.info(f"Removed worker: {worker_name}")
 
     def refresh_all_workers(self):
-        old_info = dict(self.worker_info)
-        self.worker_info = {}
-
-        for w_name, w_info in old_info.items():
-            if not self.register_worker(
-                w_name, w_info.check_heart_beat, None, w_info.multimodal
-            ):
-                logger.info(f"Remove stale worker: {w_name}")
+        if self.worker_info:
+            worker_name = list(self.worker_info.keys())[0]
+            # w_info = self.worker_info[worker_name] # Not used
+            if not self.get_worker_status_direct(worker_name):
+                 logger.warning(f"Stale worker detected during refresh: {worker_name}. Removing.")
+                 self.remove_worker(worker_name)
+            else:
+                 logger.info(f"Refreshed worker: {worker_name}")
+        else:
+            logger.info("No worker to refresh.")
 
     def list_models(self):
-        model_names = set()
+        if self.worker_info:
+            worker = list(self.worker_info.values())[0]
+            return worker.model_names
+        return []
 
-        for w_name, w_info in self.worker_info.items():
-            model_names.update(w_info.model_names)
+    def list_multimodal_models(self): # Retained for compatibility, behavior simplified
+        if self.worker_info:
+            worker = list(self.worker_info.values())[0]
+            if worker.multimodal:
+                return worker.model_names
+        return []
 
-        return list(model_names)
-
-    def list_multimodal_models(self):
-        model_names = set()
-
-        for w_name, w_info in self.worker_info.items():
-            if w_info.multimodal:
-                model_names.update(w_info.model_names)
-
-        return list(model_names)
-
-    def list_language_models(self):
-        model_names = set()
-
-        for w_name, w_info in self.worker_info.items():
-            if not w_info.multimodal:
-                model_names.update(w_info.model_names)
-
-        return list(model_names)
+    def list_language_models(self): # Retained for compatibility, behavior simplified
+        if self.worker_info:
+            worker = list(self.worker_info.values())[0]
+            if not worker.multimodal:
+                return worker.model_names
+        return []
 
     def get_worker_address(self, model_name: str):
-        if self.dispatch_method == DispatchMethod.LOTTERY:
-            worker_names = []
-            worker_speeds = []
-            for w_name, w_info in self.worker_info.items():
-                if model_name in w_info.model_names:
-                    worker_names.append(w_name)
-                    worker_speeds.append(w_info.speed)
-            worker_speeds = np.array(worker_speeds, dtype=np.float32)
-            norm = np.sum(worker_speeds)
-            if norm < 1e-4:
-                return ""
-            worker_speeds = worker_speeds / norm
-            if True:  # Directly return address
-                pt = np.random.choice(np.arange(len(worker_names)), p=worker_speeds)
-                worker_name = worker_names[pt]
+        if self.worker_info:
+            worker_name = list(self.worker_info.keys())[0] # Get the first (and only) worker
+            worker_data = self.worker_info[worker_name]
+            if model_name in worker_data.model_names:
+                # logger.info(f"Get worker address for {model_name}: {worker_name}") # Too verbose
                 return worker_name
-
-            # Check status before returning
-            while True:
-                pt = np.random.choice(np.arange(len(worker_names)), p=worker_speeds)
-                worker_name = worker_names[pt]
-
-                if self.get_worker_status(worker_name):
-                    break
-                else:
-                    self.remove_worker(worker_name)
-                    worker_speeds[pt] = 0
-                    norm = np.sum(worker_speeds)
-                    if norm < 1e-4:
-                        return ""
-                    worker_speeds = worker_speeds / norm
-                    continue
-            return worker_name
-        elif self.dispatch_method == DispatchMethod.SHORTEST_QUEUE:
-            worker_names = []
-            worker_qlen = []
-            for w_name, w_info in self.worker_info.items():
-                if model_name in w_info.model_names:
-                    worker_names.append(w_name)
-                    worker_qlen.append(w_info.queue_length / w_info.speed)
-            if len(worker_names) == 0:
-                return ""
-            min_index = np.argmin(worker_qlen)
-            w_name = worker_names[min_index]
-            self.worker_info[w_name].queue_length += 1
-            logger.info(
-                f"names: {worker_names}, queue_lens: {worker_qlen}, ret: {w_name}"
-            )
-            return w_name
-        else:
-            raise ValueError(f"Invalid dispatch method: {self.dispatch_method}")
+        logger.warning(f"No worker available for model: {model_name}")
+        return ""
 
     def receive_heart_beat(self, worker_name: str, queue_length: int):
-        if worker_name not in self.worker_info:
-            logger.info(f"Receive unknown heart beat. {worker_name}")
-            return False
-
-        self.worker_info[worker_name].queue_length = queue_length
-        self.worker_info[worker_name].last_heart_beat = time.time()
-        logger.info(f"Receive heart beat. {worker_name}")
-        return True
+        if worker_name in self.worker_info:
+            self.worker_info[worker_name].queue_length = queue_length
+            self.worker_info[worker_name].last_heart_beat = time.time()
+            return True
+        # else: # Do not log for unknown heartbeats if they are frequent
+            # logger.info(f"Receive unknown heart beat from {worker_name}")
+        return False
 
     def remove_stale_workers_by_expiration(self):
         expire = time.time() - CONTROLLER_HEART_BEAT_EXPIRATION
         to_delete = []
-        for worker_name, w_info in self.worker_info.items():
+        # Iterate over a copy for safe deletion
+        for worker_name, w_info in list(self.worker_info.items()):
             if w_info.check_heart_beat and w_info.last_heart_beat < expire:
                 to_delete.append(worker_name)
 
         for worker_name in to_delete:
+            logger.warning(f"Worker {worker_name} timed out. Removing.")
             self.remove_worker(worker_name)
 
-    def handle_no_worker(self, params):
-        logger.info(f"no worker: {params['model']}")
-        ret = {
-            "text": SERVER_ERROR_MSG,
-            "error_code": ErrorCode.CONTROLLER_NO_WORKER,
-        }
-        return json.dumps(ret).encode() + b"\0"
+    # Removed worker_api_get_status and worker_api_generate_stream from Controller class
+    # as controller no longer acts as a worker.
 
-    def handle_worker_timeout(self, worker_address):
-        logger.info(f"worker timeout: {worker_address}")
-        ret = {
-            "text": SERVER_ERROR_MSG,
-            "error_code": ErrorCode.CONTROLLER_WORKER_TIMEOUT,
-        }
-        return json.dumps(ret).encode() + b"\0"
-
-    # Let the controller act as a worker to achieve hierarchical
-    # management. This can be used to connect isolated sub networks.
-    def worker_api_get_status(self):
-        model_names = set()
-        speed = 0
-        queue_length = 0
-
-        for w_name in self.worker_info:
-            worker_status = self.get_worker_status(w_name)
-            if worker_status is not None:
-                model_names.update(worker_status["model_names"])
-                speed += worker_status["speed"]
-                queue_length += worker_status["queue_length"]
-
-        model_names = sorted(list(model_names))
-        return {
-            "model_names": model_names,
-            "speed": speed,
-            "queue_length": queue_length,
-        }
-
-    def worker_api_generate_stream(self, params):
-        worker_addr = self.get_worker_address(params["model"])
-        if not worker_addr:
-            yield self.handle_no_worker(params)
-
-        try:
-            response = requests.post(
-                worker_addr + "/worker_generate_stream",
-                json=params,
-                stream=True,
-                timeout=WORKER_API_TIMEOUT,
-            )
-            for chunk in response.iter_lines(decode_unicode=False, delimiter=b"\0"):
-                if chunk:
-                    yield chunk + b"\0"
-        except requests.exceptions.RequestException as e:
-            yield self.handle_worker_timeout(worker_addr)
-
-
-app = FastAPI()
-
-
+# FastAPI Endpoints
 @app.post("/register_worker")
-async def register_worker(request: Request):
+async def app_register_worker(request: Request):
+    global controller_instance
     data = await request.json()
-    controller.register_worker(
-        data["worker_name"],
-        data["check_heart_beat"],
-        data.get("worker_status", None),
-        data.get("multimodal", False),
+    multimodal = data.get("multimodal", False) # Default to False if not provided
+    worker_status = data.get("worker_status", None) # Can be None
+    success = controller_instance.register_worker(
+        data["worker_name"], data["check_heart_beat"], worker_status, multimodal
     )
-
+    if success:
+        return {"message": "Worker registered/updated successfully."}
+    else:
+        return {"message": "Worker registration failed."} # More generic message
 
 @app.post("/refresh_all_workers")
-async def refresh_all_workers():
-    models = controller.refresh_all_workers()
-
+async def app_refresh_all_workers():
+    global controller_instance
+    controller_instance.refresh_all_workers()
+    return {"message": "Workers refreshed successfully."}
 
 @app.post("/list_models")
-async def list_models():
-    models = controller.list_models()
+async def app_list_models():
+    global controller_instance
+    models = controller_instance.list_models()
     return {"models": models}
-
 
 @app.post("/list_multimodal_models")
-async def list_multimodal_models():
-    models = controller.list_multimodal_models()
+async def app_list_multimodal_models():
+    global controller_instance
+    models = controller_instance.list_multimodal_models()
     return {"models": models}
-
 
 @app.post("/list_language_models")
-async def list_language_models():
-    models = controller.list_language_models()
+async def app_list_language_models():
+    global controller_instance
+    models = controller_instance.list_language_models()
     return {"models": models}
 
-
 @app.post("/get_worker_address")
-async def get_worker_address(request: Request):
+async def app_get_worker_address(request: Request):
+    global controller_instance
     data = await request.json()
-    addr = controller.get_worker_address(data["model"])
+    addr = controller_instance.get_worker_address(data["model"])
     return {"address": addr}
 
-
 @app.post("/receive_heart_beat")
-async def receive_heart_beat(request: Request):
+async def app_receive_heart_beat(request: Request):
+    global controller_instance
     data = await request.json()
-    exist = controller.receive_heart_beat(data["worker_name"], data["queue_length"])
+    exist = controller_instance.receive_heart_beat(data["worker_name"], data["queue_length"])
     return {"exist": exist}
 
-
-@app.post("/worker_generate_stream")
-async def worker_api_generate_stream(request: Request):
-    params = await request.json()
-    generator = controller.worker_api_generate_stream(params)
-    return StreamingResponse(generator)
-
-
-@app.post("/worker_get_status")
-async def worker_api_get_status(request: Request):
-    return controller.worker_api_get_status()
-
-
 @app.get("/test_connection")
-async def worker_api_get_status(request: Request):
-    return "success"
+async def app_test_connection():
+    return {"message": "Controller is active."}
 
 
-def create_controller():
+def create_fastapi_app(args): # Renamed from create_controller to avoid confusion
+    global controller_instance
+    controller_instance = Controller(args.dispatch_method) # dispatch_method is vestigial
+    logger.info("FastChat YeongjoPT Controller is running.")
+    return app # Return the global app instance with routes attached
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=21001)
     parser.add_argument(
-        "--dispatch-method",
+        "--dispatch-method", # This argument is no longer used by Controller logic
         type=str,
-        choices=["lottery", "shortest_queue"],
-        default="shortest_queue",
+        default="shortest_queue", # Default value, but logic is removed
+        choices=["lottery", "shortest_queue"], # Kept for CLI compatibility for now
     )
     parser.add_argument(
         "--ssl",
         action="store_true",
         required=False,
         default=False,
-        help="Enable SSL. Requires OS Environment variables 'SSL_KEYFILE' and 'SSL_CERTFILE'.",
+        help="Enable SSL for controller server.",
     )
     args = parser.parse_args()
-    logger.info(f"args: {args}")
+    # logger.info(f"args: {args}") # Can be verbose
 
-    controller = Controller(args.dispatch_method)
-    return args, controller
+    # Configure logger
+    logger.handlers.clear() # Remove existing handlers
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(stream_handler)
+    logger.setLevel(logging.INFO)
 
 
-if __name__ == "__main__":
-    args, controller = create_controller()
+    # Create the FastAPI app and controller instance
+    # The app instance is global, create_fastapi_app initializes the controller
+    initialized_app = create_fastapi_app(args)
+
     if args.ssl:
+        # Ensure FASTCHAT_SSL_KEY and FASTCHAT_SSL_CERT env vars are set
+        # if not (os.environ.get("FASTCHAT_SSL_KEY") and os.environ.get("FASTCHAT_SSL_CERT")):
+        #     raise ValueError("FASTCHAT_SSL_KEY and FASTCHAT_SSL_CERT must be set for SSL")
+        logger.info(f"Running with SSL. Key: {os.environ.get('FASTCHAT_SSL_KEY')}, Cert: {os.environ.get('FASTCHAT_SSL_CERT')}")
         uvicorn.run(
-            app,
+            initialized_app,
             host=args.host,
             port=args.port,
             log_level="info",
-            ssl_keyfile=os.environ["SSL_KEYFILE"],
-            ssl_certfile=os.environ["SSL_CERTFILE"],
+            ssl_keyfile=os.environ.get("FASTCHAT_SSL_KEY"),
+            ssl_certfile=os.environ.get("FASTCHAT_SSL_CERT"),
         )
     else:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        logger.info(f"Running without SSL on http://{args.host}:{args.port}")
+        uvicorn.run(initialized_app, host=args.host, port=args.port, log_level="info")

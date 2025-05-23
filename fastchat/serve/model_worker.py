@@ -14,11 +14,12 @@ import torch.nn.functional as F
 from transformers import set_seed
 import uvicorn
 
-from fastchat.constants import ErrorCode, SERVER_ERROR_MSG
+from fastchat.constants import ErrorCode, SERVER_ERROR_MSG, WORKER_HEART_BEAT_INTERVAL
 from fastchat.model.model_adapter import (
     load_model,
     add_model_args,
     get_generate_stream_function,
+    get_conversation_template,
 )
 from fastchat.modules.awq import AWQConfig
 from fastchat.modules.exllama import ExllamaConfig
@@ -63,17 +64,24 @@ class ModelWorker(BaseModelWorker):
         debug: bool = False,
         **kwargs,
     ):
+        if model_names:
+            effective_model_names = [model_names[0]]
+        else:
+            effective_model_names = [os.path.basename(model_path).replace("_", "-").replace(".", "-")]
+        
+        logger.info(f"Using model names: {effective_model_names}")
+
         super().__init__(
             controller_addr,
             worker_addr,
             worker_id,
             model_path,
-            model_names,
+            effective_model_names,
             limit_worker_concurrency,
             conv_template=conv_template,
         )
 
-        logger.info(f"Loading the model {self.model_names} on worker {worker_id} ...")
+        logger.info(f"Loading model {self.model_names[0]} ({model_path}) on worker {worker_id} ...")
         self.model, self.tokenizer = load_model(
             model_path,
             revision=revision,
@@ -92,14 +100,23 @@ class ModelWorker(BaseModelWorker):
         self.device = device
         if self.tokenizer.pad_token == None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.context_len = get_context_length(self.model.config)
+        
+        try:
+            self.context_len = get_context_length(self.model.config)
+        except AttributeError as e:
+            logger.warning(f"Could not get context_length from model.config: {e}. Using default or previously set.")
+            if not hasattr(self, 'context_len') or not self.context_len:
+                 conv = get_conversation_template(self.conv_template if self.conv_template else self.model_names[0])
+                 self.context_len = getattr(conv, 'context_len', 2048)
+                 logger.info(f"Set context_len to {self.context_len} from conversation template or default.")
+
         self.generate_stream_func = get_generate_stream_function(self.model, model_path)
         self.stream_interval = stream_interval
         self.embed_in_truncate = embed_in_truncate
         self.seed = seed
 
         if not no_register:
-            self.init_heart_beat()
+            self.init_heart_beat(WORKER_HEART_BEAT_INTERVAL)
 
     def generate_stream_gate(self, params):
         if self.device == "npu":
@@ -232,7 +249,6 @@ class ModelWorker(BaseModelWorker):
                     chunk_input_ids = input_ids[:, i : i + self.context_len]
                     chunk_attention_mask = attention_mask[:, i : i + self.context_len]
 
-                    # add cls token and mask to get cls embedding
                     if (
                         hasattr(self.model, "use_cls_pooling")
                         and self.model.use_cls_pooling
@@ -363,37 +379,33 @@ def create_model_worker():
         wbits=args.awq_wbits,
         groupsize=args.awq_groupsize,
     )
-    if args.enable_exllama:
-        exllama_config = ExllamaConfig(
-            max_seq_len=args.exllama_max_seq_len,
-            gpu_split=args.exllama_gpu_split,
-            cache_8bit=args.exllama_cache_8bit,
-        )
-    else:
-        exllama_config = None
-    if args.enable_xft:
-        xft_config = XftConfig(
-            max_seq_len=args.xft_max_seq_len,
-            data_type=args.xft_dtype,
-        )
-        if args.device != "cpu":
-            print("xFasterTransformer now is only support CPUs. Reset device to CPU")
-            args.device = "cpu"
-    else:
-        xft_config = None
+    exllama_config = ExllamaConfig(
+        max_seq_len=args.exllama_max_seq_len,
+        gpu_split=args.exllama_gpu_split,
+        cache_8bit=args.exllama_cache_8bit,
+    )
+    xft_config = XftConfig(
+        max_seq_len=args.xft_max_seq_len,
+        data_type=args.xft_dtype,
+    )
+
+    model_names_list = args.model_names if args.model_names else [os.path.basename(args.model_path)]
+    if len(model_names_list) > 1:
+        logger.warning(f"Multiple model names provided ({model_names_list}), but YeongjoPT worker will only use the first one: {model_names_list[0]}")
+    final_model_name_for_worker = [model_names_list[0]]
 
     worker = ModelWorker(
         args.controller_address,
         args.worker_address,
         worker_id,
         args.model_path,
-        args.model_names,
+        final_model_name_for_worker,
         args.limit_worker_concurrency,
+        args.no_register,
+        args.device,
+        args.num_gpus,
+        args.max_gpu_memory,
         revision=args.revision,
-        no_register=args.no_register,
-        device=args.device,
-        num_gpus=args.num_gpus,
-        max_gpu_memory=args.max_gpu_memory,
         dtype=str_to_torch_dtype(args.dtype),
         load_8bit=args.load_8bit,
         cpu_offloading=args.cpu_offloading,
